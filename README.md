@@ -1,5 +1,5 @@
 # H1B Job Hunt Automation
-### Sai Jagadeesh Hazari — Senior SDET
+### Name — Job Role
 
 Runs every 12 hours via GitHub Actions (free).
 Scrapes → H1B filters → ATS scores vs your resume → saves Excel → emails top matches.
