@@ -1,7 +1,20 @@
 """
-H1B Job Hunt Automation — Sai Jagadeesh Hazari
+Job Hunt Automation
 Runs every 12 hours via GitHub Actions (or cron).
-Scrapes company career pages → filters H1B → ATS scores vs resume → saves Excel → emails top matches.
+Scrapes company career pages → filters by visa mode (H1B / OPT-CPT / STEM-OPT / all)
+→ ATS scores vs resume → saves 3-sheet Excel (Tracker + Dashboard + Legend) → emails top matches.
+
+SETUP — set these GitHub Secrets (or environment variables):
+  YOUR_NAME         Your full name
+  YOUR_EMAIL        Your Gmail address
+  GMAIL_APP_PASS    Gmail App Password (not your real password)
+  RESUME_URL        Public URL to your resume PDF (optional)
+  YOUR_TITLE        Your professional title for email subject  e.g. "Senior Software Engineer"
+  YOUR_PHONE        Your phone number for email signature
+  YOUR_LINKEDIN     Your LinkedIn profile URL
+  RESUME_SUMMARY    Plain-text resume summary for ATS keyword scoring (optional)
+  VISA_MODE         "h1b" | "opt_cpt" | "stem_opt" | "all"  (default: "all")
+  JOB_SEARCH_QUERY  Keywords to search  (default: "software engineer")
 """
 
 import os, re, json, time, logging, smtplib, hashlib
@@ -22,97 +35,127 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-# CONFIGURATION — edit these or use env vars
+# CONFIGURATION — set via GitHub Secrets or env vars (no hardcoded values)
 # ─────────────────────────────────────────────
 
-YOUR_NAME      = os.getenv("YOUR_NAME",  "Sai Jagadeesh Hazari")
-YOUR_EMAIL     = os.getenv("YOUR_EMAIL", "hazarisaijagadeesh@gmail.com")
+YOUR_NAME      = os.getenv("YOUR_NAME",  "")           # e.g. "Jane Smith"
+YOUR_EMAIL     = os.getenv("YOUR_EMAIL", "")           # e.g. "jane@gmail.com"
+YOUR_TITLE     = os.getenv("YOUR_TITLE", "Software Engineer")  # shown in email subject line
+YOUR_PHONE     = os.getenv("YOUR_PHONE", "")           # e.g. "+1 555-123-4567"
+YOUR_LINKEDIN  = os.getenv("YOUR_LINKEDIN", "")        # e.g. "https://linkedin.com/in/yourname"
 GMAIL_APP_PASS = os.getenv("GMAIL_APP_PASS", "")       # Gmail App Password (not your real password)
 EXCEL_PATH     = Path("output/job_tracker.xlsx")
 SEEN_JOBS_FILE = Path("output/seen_jobs.json")
-MIN_ATS_SCORE  = 70   # only shortlist jobs scoring >= this
-MAX_APPLY_PER_RUN = 5 # cap applications per run to avoid spam
+MIN_ATS_SCORE  = int(os.getenv("MIN_ATS_SCORE", "70"))     # only shortlist jobs scoring >= this
+MAX_APPLY_PER_RUN = int(os.getenv("MAX_APPLY_PER_RUN", "5"))  # cap applications per run
 
-RESUME_SUMMARY = """
-Senior SDET / QA Automation Engineer with 4+ years at American Express.
-Skills: Selenium WebDriver, Playwright, Java, Python, JavaScript, RestAssured,
-Cucumber BDD, TestNG, JUnit, Postman, PyTest, Jenkins, GitHub Actions, GitLab CI,
-Maven, Docker, AWS (EC2, S3, RDS), MySQL, MongoDB, Jira, Agile/Scrum, Salesforce.
-Led migration of 1000+ test scenarios from Selenium to Playwright (~60% faster).
-Increased regression coverage by 70%. Automated 500+ end-to-end web/API scenarios.
-Delivered zero critical defects across multiple production releases.
-Built AI-powered Playwright test script generator from Rally user stories.
-MS Computer Science, University of Central Missouri.
-Authorized to work in the US (requires H1B visa sponsorship).
+# Job search keyword — customise per role/field
+JOB_SEARCH_QUERY = os.getenv("JOB_SEARCH_QUERY", "software engineer")
+
+# ── Visa mode ─────────────────────────────────────────────────────────────────
+# Set VISA_MODE env var to control which jobs are surfaced:
+#   "h1b"       → only H1B sponsoring companies
+#   "opt_cpt"   → companies accepting OPT / CPT / STEM-OPT
+#   "stem_opt"  → STEM-OPT specific
+#   "all"       → all three modes combined (widest net, default)
+VISA_MODE = os.getenv("VISA_MODE", "all").lower()
+
+# ── Resume summary for ATS keyword scoring ───────────────────────────────────
+# Option A (recommended): set the RESUME_SUMMARY env var / GitHub Secret with
+#   a plain-text paste of your resume.
+# Option B: edit the fallback string below.
+_RESUME_SUMMARY_DEFAULT = """
+Software engineer with experience in backend and full-stack development.
+Skills: Python, Java, JavaScript, TypeScript, Node.js, React, REST APIs,
+SQL, PostgreSQL, MongoDB, Docker, Kubernetes, AWS, CI/CD, Git, Agile.
+Authorized to work in the US (requires visa sponsorship).
 """
+RESUME_SUMMARY = os.getenv("RESUME_SUMMARY", _RESUME_SUMMARY_DEFAULT)
 
 # Target companies: (display name, careers page URL, optional keyword to find job links)
 # ── Direct company career pages ──────────────────────────────────────────────
+# Target companies — search URLs use JOB_SEARCH_QUERY so they adapt to your role
+# ── Direct company career pages ──────────────────────────────────────────────
+_Q = JOB_SEARCH_QUERY.replace(" ", "+")
+_Q_ENC = JOB_SEARCH_QUERY.replace(" ", "%20")
 COMPANIES = [
-    ("Google",          "https://careers.google.com/jobs/results/?q=QA+automation&employment_type=FULL_TIME",  None),
-    ("Meta",            "https://www.metacareers.com/jobs?q=QA+automation&teams[0]=Engineering",                None),
-    ("Amazon",          "https://www.amazon.jobs/en/search?base_query=SDET+QA+automation&loc_query=",          None),
-    ("Microsoft",       "https://jobs.microsoft.com/us/en/search#q=QA%20automation%20SDET&p=1",               None),
-    ("Salesforce",      "https://careers.salesforce.com/en/jobs/?search=QA+automation&department=Software+Engineering", None),
-    ("JPMorgan Chase",  "https://jpmc.fa.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1001/requisitions?keyword=SDET+QA+automation", None),
-    ("Apple",           "https://jobs.apple.com/en-us/search?search=QA+automation+SDET&sort=relevance",        None),
-    ("Netflix",         "https://jobs.netflix.com/search?q=QA%20automation",                                  None),
-    ("Stripe",          "https://stripe.com/jobs/search?query=QA+automation",                                 None),
-    ("Uber",            "https://www.uber.com/us/en/careers/list/?query=QA+automation",                       None),
-    ("Twilio",          "https://boards.greenhouse.io/twilio",                                                 "QA"),
-    ("Atlassian",       "https://www.atlassian.com/company/careers/all-jobs?team=Engineering&search=QA",       None),
-    ("ServiceNow",      "https://careers.servicenow.com/careers/jobs?keywords=QA+automation+SDET",             None),
-    ("Workday",         "https://www.workday.com/en-us/company/careers/open-positions.html?q=QA+automation",   None),
-    ("Adobe",           "https://careers.adobe.com/us/en/search-results?keywords=QA+automation",               None),
-    ("Intuit",          "https://jobs.intuit.com/search-jobs?keyword=SDET+QA+automation",                      None),
-    ("PayPal",          "https://careers.pypl.com/jobs/?keyword=QA+automation+SDET",                           None),
-    ("Cisco",           "https://jobs.cisco.com/jobs/SearchJobs/QA%20automation%20SDET",                       None),
-    ("Oracle",          "https://careers.oracle.com/jobs/#en/sites/jobsearch/jobs?keyword=QA+automation+SDET", None),
-    ("IBM",             "https://www.ibm.com/employment/#jobs?job-search=QA+automation+SDET",                  None),
+    ("Google",         f"https://careers.google.com/jobs/results/?q={_Q}&employment_type=FULL_TIME",                           None),
+    ("Meta",           f"https://www.metacareers.com/jobs?q={_Q}&teams[0]=Engineering",                                        None),
+    ("Amazon",         f"https://www.amazon.jobs/en/search?base_query={_Q}&loc_query=",                                        None),
+    ("Microsoft",      f"https://jobs.microsoft.com/us/en/search#q={_Q_ENC}&p=1",                                              None),
+    ("Salesforce",     f"https://careers.salesforce.com/en/jobs/?search={_Q}&department=Software+Engineering",                 None),
+    ("JPMorgan Chase", f"https://jpmc.fa.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1001/requisitions?keyword={_Q}",None),
+    ("Apple",          f"https://jobs.apple.com/en-us/search?search={_Q}&sort=relevance",                                      None),
+    ("Netflix",        f"https://jobs.netflix.com/search?q={_Q_ENC}",                                                         None),
+    ("Stripe",         f"https://stripe.com/jobs/search?query={_Q}",                                                          None),
+    ("Uber",           f"https://www.uber.com/us/en/careers/list/?query={_Q}",                                                 None),
+    ("Twilio",          "https://boards.greenhouse.io/twilio",                                                                  "engineer"),
+    ("Atlassian",      f"https://www.atlassian.com/company/careers/all-jobs?team=Engineering&search={_Q}",                     None),
+    ("ServiceNow",     f"https://careers.servicenow.com/careers/jobs?keywords={_Q}",                                           None),
+    ("Workday",        f"https://www.workday.com/en-us/company/careers/open-positions.html?q={_Q}",                            None),
+    ("Adobe",          f"https://careers.adobe.com/us/en/search-results?keywords={_Q}",                                        None),
+    ("Intuit",         f"https://jobs.intuit.com/search-jobs?keyword={_Q}",                                                    None),
+    ("PayPal",         f"https://careers.pypl.com/jobs/?keyword={_Q}",                                                         None),
+    ("Cisco",          f"https://jobs.cisco.com/jobs/SearchJobs/{_Q_ENC}",                                                     None),
+    ("Oracle",         f"https://careers.oracle.com/jobs/#en/sites/jobsearch/jobs?keyword={_Q}",                               None),
+    ("IBM",            f"https://www.ibm.com/employment/#jobs?job-search={_Q}",                                                None),
 ]
 
 # ── Job portals — parsed with dedicated scrapers below ───────────────────────
 # Each entry: (portal_name, search_url, parser_key)
 JOB_PORTALS = [
-    # LinkedIn public job search (no login needed for listings page)
-    ("LinkedIn",   "https://www.linkedin.com/jobs/search/?keywords=SDET+QA+automation&location=United+States&f_WT=2&f_JT=F",  "linkedin"),
-    # Indeed
-    ("Indeed",     "https://www.indeed.com/jobs?q=SDET+QA+automation+%22visa+sponsorship%22&l=United+States&jt=fulltime",     "indeed"),
-    # Dice — tech-focused, great for SDET roles
-    ("Dice",       "https://www.dice.com/jobs?q=SDET+QA+automation&location=United+States&filters.workplaceTypes=Remote&filters.employmentType=FULLTIME", "dice"),
-    # Monster
-    ("Monster",    "https://www.monster.com/jobs/search?q=SDET+QA+automation&where=United+States&jobtype=fulltime",            "monster"),
-    # ZipRecruiter
-    ("ZipRecruiter","https://www.ziprecruiter.com/Jobs/SDET-QA-Automation?radius=25&days=3",                                   "generic"),
-    # SimplyHired
-    ("SimplyHired","https://www.simplyhired.com/search?q=SDET+QA+automation+visa+sponsorship&l=United+States",                 "simplyhired"),
-    # Glassdoor
-    ("Glassdoor",  "https://www.glassdoor.com/Job/united-states-sdet-qa-automation-jobs-SRCH_IL.0,13_IN1_KO14,32.htm",        "glassdoor"),
-    # CareerBuilder
-    ("CareerBuilder","https://www.careerbuilder.com/jobs?keywords=SDET+QA+automation&location=United+States&emp=jtft",        "generic"),
-    # Wellfound (AngelList) — great for startup SDET roles with sponsorship
-    ("Wellfound",  "https://wellfound.com/jobs?role=qa-engineer&remote=true",                                                  "generic"),
-    # Greenhouse job board aggregator
-    ("Greenhouse", "https://boards.greenhouse.io/embed/job_board?for=",                                                        "greenhouse"),
-    # Lever job board aggregator
-    ("Lever",      "https://jobs.lever.co/",                                                                                   "lever"),
-    # Built In — tech jobs with H1B filter
-    ("Built In",   "https://builtin.com/jobs/dev-engineer/qa?title=QA+Automation+SDET",                                       "generic"),
-    # Remotive — remote tech jobs
-    ("Remotive",   "https://remotive.com/remote-jobs/qa?search=automation",                                                    "remotive"),
-    # We Work Remotely
-    ("WeWorkRemotely", "https://weworkremotely.com/remote-jobs/search?term=QA+automation+SDET",                               "generic"),
+    ("LinkedIn",      f"https://www.linkedin.com/jobs/search/?keywords={_Q}+visa+sponsorship&location=United+States&f_WT=2&f_JT=F",  "linkedin"),
+    ("Indeed",        f"https://www.indeed.com/jobs?q={_Q}+%22visa+sponsorship%22&l=United+States&jt=fulltime",                       "indeed"),
+    ("Dice",          f"https://www.dice.com/jobs?q={_Q}&location=United+States&filters.workplaceTypes=Remote&filters.employmentType=FULLTIME", "dice"),
+    ("Monster",       f"https://www.monster.com/jobs/search?q={_Q}&where=United+States&jobtype=fulltime",                             "monster"),
+    ("ZipRecruiter",  f"https://www.ziprecruiter.com/Jobs/{_Q.replace('+', '-')}?radius=25&days=3",                                   "generic"),
+    ("SimplyHired",   f"https://www.simplyhired.com/search?q={_Q}+visa+sponsorship&l=United+States",                                  "simplyhired"),
+    ("Glassdoor",     f"https://www.glassdoor.com/Job/united-states-{_Q.replace('+', '-')}-jobs-SRCH_IL.0,13_IN1.htm",               "glassdoor"),
+    ("CareerBuilder", f"https://www.careerbuilder.com/jobs?keywords={_Q}+visa+sponsorship&location=United+States&emp=jtft",           "generic"),
+    ("Wellfound",      "https://wellfound.com/jobs?role=software-engineer&remote=true",                                               "generic"),
+    ("Greenhouse",     "https://boards.greenhouse.io/embed/job_board?for=",                                                           "greenhouse"),
+    ("Lever",          "https://jobs.lever.co/",                                                                                      "lever"),
+    ("Built In",      f"https://builtin.com/jobs/dev-engineer?title={_Q}",                                                           "generic"),
+    ("Remotive",       "https://remotive.com/remote-jobs/software-dev",                                                              "remotive"),
+    ("WeWorkRemotely",f"https://weworkremotely.com/remote-jobs/search?term={_Q}",                                                     "generic"),
+    ("MyVisaJobs",    f"https://www.myvisajobs.com/{_Q.replace('+', '-')}_JT.htm",                                                   "generic"),
+    ("H1BGrader",     f"https://h1bgrader.com/job-openings?q={_Q}",                                                                  "generic"),
+    ("OPTNation",     f"https://www.optnation.com/opt-jobs-for-international-students?job={_Q}",                                      "generic"),
+    ("F1Hire",        f"https://www.f1hire.com/jobs?q={_Q}",                                                                         "generic"),
+    ("RippleMatch",   f"https://ripplematch.com/jobs?q={_Q}&workAuth=OPT",                                                           "generic"),
 ]
+
+# ── Visa / sponsorship keyword lists ─────────────────────────────────────────
 
 H1B_POSITIVE = [
     "visa sponsorship", "sponsor visa", "h1b", "h-1b", "will sponsor",
     "work authorization provided", "we sponsor", "sponsorship available",
-    "immigration sponsorship", "visa support", "relocation and visa"
+    "immigration sponsorship", "visa support", "relocation and visa",
+    "sponsor work visa", "work visa sponsorship", "visa assistance",
+    "tn visa", "o-1 visa", "employment authorization", "sponsor employment",
+    "sponsor immigration", "visa transfer", "h1b transfer"
 ]
 H1B_NEGATIVE = [
     "no sponsorship", "not sponsor", "must be authorized", "must be legally authorized",
     "no visa", "citizens only", "us citizens and permanent residents only",
-    "must have authorization to work", "no h1b"
+    "must have authorization to work", "no h1b", "no work visa",
+    "permanent resident only", "green card only", "no opt", "no cpt",
+    "no student visa", "not eligible for sponsorship"
+]
+
+# OPT / CPT / STEM-OPT — companies that explicitly welcome F-1 students
+OPT_CPT_POSITIVE = [
+    "opt", "cpt", "stem opt", "stem extension", "f-1", "f1 visa",
+    "student visa", "curricular practical training", "optional practical training",
+    "welcome opt", "accept opt", "f-1 students", "international students welcome",
+    "open to opt", "open to cpt", "internship opt", "work authorization",
+    "eligible to work", "authorized to work", "employment eligibility",
+]
+OPT_CPT_NEGATIVE = [
+    "no opt", "no cpt", "no f-1", "no student visa", "no international",
+    "citizens only", "permanent resident only", "green card only",
+    "no sponsorship", "no visa", "not eligible for sponsorship",
+    "us citizens and permanent residents only",
 ]
 USA_PATTERNS = [
     r"\b(?:united states|united states of america|usa|u\.s\.a|u\.s\.|us|america)\b",
@@ -128,14 +171,26 @@ INDIA_PATTERNS = [
 REMOTE_OK = [r"\bremote\b.*\b(?:usa|us|united states|india|indian)\b", r"\b(?:usa|india)\b.*\bremote\b"]
 
 ROLE_POSITIVE = [
+    # QA / Test (original)
     "sdet", "software engineer in test", "qa automation", "test automation",
     "quality engineer", "automation engineer", "qa engineer", "quality assurance",
-    "test engineer"
+    "test engineer",
+    # Software Engineering (new)
+    "software engineer", "software developer", "backend engineer", "backend developer",
+    "frontend engineer", "frontend developer", "full stack engineer", "full stack developer",
+    "full-stack engineer", "full-stack developer", "web developer", "web engineer",
+    "application developer", "application engineer", "platform engineer",
+    "infrastructure engineer", "devops engineer", "site reliability engineer", "sre",
+    "cloud engineer", "systems engineer", "data engineer", "ml engineer",
+    "machine learning engineer", "api engineer", "java developer", "python developer",
+    "nodejs developer", "node.js developer",
 ]
 
 ROLE_NEGATIVE = [
     "data scientist", "sales", "recruiter", "marketing", "human resources",
-    "hr", "accountant", "product manager", "business analyst"
+    "hr manager", "accountant", "business analyst", "product manager",
+    "project manager", "content writer", "graphic designer", "customer support",
+    "customer service", "operations manager", "finance manager",
 ]
 
 def normalize_text(text: str) -> str:
@@ -186,7 +241,7 @@ def save_seen(seen: set):
     SEEN_JOBS_FILE.write_text(json.dumps(list(seen)))
 
 def h1b_status(text: str) -> str:
-    """Returns 'yes', 'no', or 'unknown' based on job description text."""
+    """Returns 'yes', 'no', or 'unknown' based on H1B sponsorship signals."""
     t = text.lower()
     if any(p in t for p in H1B_NEGATIVE):
         return "no"
@@ -195,13 +250,24 @@ def h1b_status(text: str) -> str:
     return "unknown"
 
 
+def opt_cpt_status(text: str) -> str:
+    """Returns 'yes', 'no', or 'unknown' based on OPT/CPT/STEM-OPT signals."""
+    t = text.lower()
+    if any(p in t for p in OPT_CPT_NEGATIVE):
+        return "no"
+    if any(p in t for p in OPT_CPT_POSITIVE):
+        return "yes"
+    return "unknown"
+
+
 def annotate_job(job: dict) -> dict:
-    """Add derived fields such as H1B sponsorship likelihood."""
+    """Add derived fields: H1B sponsorship and OPT/CPT eligibility."""
     text = " ".join([
         job.get("title", ""), job.get("snippet", ""), job.get("company", ""),
         job.get("source", ""), job.get("url", "")
     ])
-    job["h1b_likely"] = h1b_status(text)
+    job["h1b_likely"]     = h1b_status(text)
+    job["opt_cpt_likely"] = opt_cpt_status(text)
     return job
 
 # ─────────────────────────────────────────────
@@ -236,7 +302,7 @@ def extract_jobs_from_html(html: str, company: str) -> list[dict]:
         tag.decompose()
 
     # Strategy 1: look for <a> tags containing job-like text near role keywords
-    role_keywords = r"(engineer|developer|sdet|qa|quality|automation|test|analyst)"
+    role_keywords = r"(engineer|developer|sdet|qa|quality|automation|test|analyst|devops|backend|frontend|fullstack|full.stack|platform|sre|cloud|java|python)"
     seen_titles = set()
 
     for a in soup.find_all("a", href=True):
@@ -506,21 +572,37 @@ def scrape_all_companies() -> list[dict]:
 # ─────────────────────────────────────────────
 
 SKILL_WEIGHTS = [
+    # QA / Test skills
     ("playwright",        12), ("selenium",          12), ("sdet",              10),
-    ("qa automation",     10), ("test automation",    9),  ("java",               7),
-    ("python",             6), ("javascript",         4),  ("cucumber",           5),
-    ("bdd",                5), ("testng",             4),  ("junit",              4),
-    ("restassured",        5), ("pytest",             4),  ("api testing",        6),
-    ("rest api",           5), ("jenkins",            4),  ("github actions",     4),
-    ("ci/cd",              4), ("ci cd",              4),  ("aws",                3),
-    ("docker",             3), ("salesforce",         4),  ("agile",              3),
-    ("scrum",              2), ("jira",               2),  ("senior",             3),
-    ("lead",               3), ("staff",              2),  ("principal",          2),
+    ("qa automation",     10), ("test automation",    9),  ("restassured",        5),
+    ("cucumber",           5), ("bdd",                5),  ("testng",             4),
+    ("junit",              4), ("pytest",             4),  ("api testing",        6),
+    # General engineering skills
+    ("java",               7), ("python",             6),  ("javascript",         5),
+    ("typescript",         5), ("node.js",            5),  ("nodejs",             5),
+    ("react",              4), ("spring boot",        5),  ("microservices",      5),
+    ("rest api",           5), ("graphql",            4),  ("sql",                4),
+    ("mysql",              3), ("postgresql",         3),  ("mongodb",            3),
+    # DevOps / Cloud
+    ("jenkins",            4), ("github actions",     4),  ("ci/cd",              4),
+    ("ci cd",              4), ("aws",                5),  ("azure",              4),
+    ("gcp",                4), ("docker",             4),  ("kubernetes",         5),
+    # Other
+    ("salesforce",         4), ("agile",              3),  ("scrum",              2),
+    ("jira",               2), ("senior",             3),  ("lead",               3),
+    ("staff",              2), ("principal",          2),
 ]
 JUNIOR_SIGNALS = ["junior", "associate", "entry level", "entry-level", "intern", "0-2 years", "1-2 years"]
-TITLE_BOOSTS   = {"sdet":15, "qa automation":12, "test automation":12, "quality engineer":8,
-                  "automation engineer":8, "qa lead":10, "qa engineer":7,
-                  "software engineer in test":10}
+TITLE_BOOSTS   = {
+    # QA
+    "sdet": 15, "qa automation": 12, "test automation": 12, "quality engineer": 8,
+    "automation engineer": 8, "qa lead": 10, "qa engineer": 7,
+    "software engineer in test": 10,
+    # Engineering
+    "software engineer": 8, "backend engineer": 8, "full stack engineer": 8,
+    "full-stack engineer": 8, "senior software engineer": 12, "staff engineer": 10,
+    "platform engineer": 8, "devops engineer": 8, "site reliability engineer": 8,
+}
 MAX_POSSIBLE   = sum(w for _, w in SKILL_WEIGHTS) + 15
 
 def ats_score_job(job: dict) -> dict:
@@ -551,88 +633,378 @@ def ats_score_batch(jobs: list[dict]) -> list[dict]:
 
 
 # ─────────────────────────────────────────────
-# EXCEL EXPORT
+# EXCEL EXPORT  — multi-sheet workbook
+# Sheet 1: Job Tracker  (all scraped jobs)
+# Sheet 2: Dashboard    (summary stats)
+# Sheet 3: Legend       (column + status guide)
 # ─────────────────────────────────────────────
 
 EXCEL_COLS = [
-    "Date Found", "Source", "Company", "Job Title", "ATS Score", "H1B Sponsor",
-    "Match Skills", "Gaps", "AI Summary", "Apply URL", "Status", "Notes"
+    "Date Found",       # A  1
+    "Source",           # B  2
+    "Company",          # C  3
+    "Job Title",        # D  4
+    "ATS Score",        # E  5
+    "Visa Type",        # F  6  ← NEW: H1B / OPT-CPT / STEM-OPT / UNKNOWN / NO SPONSOR
+    "H1B Sponsor",      # G  7
+    "OPT/CPT Ok",       # H  8  ← NEW
+    "Match Skills",     # I  9
+    "Gaps",             # J  10
+    "AI Summary",       # K  11
+    "Apply URL",        # L  12
+    "Status",           # M  13 ← tracker dropdown values below
+    "Interview Date",   # N  14 ← NEW
+    "Follow-Up Date",   # O  15 ← NEW
+    "Offer Details",    # P  16 ← NEW
+    "Notes",            # Q  17
 ]
 
-def init_excel():
+# ── Application status values & their colors ─────────────────────────────────
+STATUS_COLORS = {
+    "New":              "DDEEFF",   # soft blue
+    "Saved":            "EEF0F1",   # light grey
+    "Applied":          "BDE0FE",   # blue
+    "Phone Screen":     "FFF1A8",   # yellow
+    "Interview":        "FFD6A5",   # orange
+    "Take-Home Test":   "FDFFB6",   # pale yellow
+    "Final Round":      "CAFFBF",   # light green
+    "Offer Received":   "52B788",   # green  (bold white text)
+    "Offer Accepted":   "1B4332",   # dark green (bold white text)
+    "Offer Declined":   "E9C46A",   # amber
+    "Rejected":         "FFADAD",   # red
+    "Ghosted":          "D3D3D3",   # grey
+    "Withdrawn":        "F4A261",   # warm orange
+    "On Hold":          "CDB4DB",   # lavender
+}
+STATUS_WHITE_TEXT = {"Offer Received", "Offer Accepted"}
+
+# ── Visa type label → display color ──────────────────────────────────────────
+VISA_TYPE_COLORS = {
+    "H1B":       "C8F7C5",   # green
+    "OPT-CPT":   "BDE0FE",   # blue
+    "STEM-OPT":  "A8DADC",   # teal
+    "POSSIBLE":  "FFF3CD",   # yellow  (unknown/unconfirmed)
+    "NO SPONSOR":"F8D7DA",   # red
+}
+
+COL_WIDTHS = [16, 14, 22, 42, 10, 13, 12, 12, 35, 25, 45, 52, 16, 15, 15, 22, 22]
+
+
+def _visa_type_label(job: dict) -> str:
+    """Derive a single display label for the Visa Type column."""
+    h1b = job.get("h1b_likely", "unknown")
+    opt = job.get("opt_cpt_likely", "unknown")
+    snippet = (job.get("snippet", "") + " " + job.get("title", "")).lower()
+
+    # Explicit STEM-OPT mention
+    if "stem opt" in snippet or "stem extension" in snippet:
+        return "STEM-OPT"
+    if opt == "yes" and h1b == "yes":
+        return "H1B"          # H1B takes priority if both confirmed
+    if h1b == "yes":
+        return "H1B"
+    if opt == "yes":
+        return "OPT-CPT"
+    if h1b == "no" and opt == "no":
+        return "NO SPONSOR"
+    return "POSSIBLE"         # neither confirmed nor denied
+
+
+def _visa_eligible(job: dict) -> bool:
+    """Return True if job passes the current VISA_MODE filter."""
+    label = _visa_type_label(job)
+    if label == "NO SPONSOR":
+        return False
+    if VISA_MODE == "h1b":
+        return label in ("H1B", "POSSIBLE")
+    if VISA_MODE == "opt_cpt":
+        return label in ("OPT-CPT", "STEM-OPT", "POSSIBLE")
+    if VISA_MODE == "stem_opt":
+        return label in ("STEM-OPT", "POSSIBLE")
+    # "all" — include everything except explicit no-sponsorship
+    return True
+
+
+def init_excel() -> openpyxl.Workbook:
     EXCEL_PATH.parent.mkdir(exist_ok=True)
     if EXCEL_PATH.exists():
         return openpyxl.load_workbook(EXCEL_PATH)
 
     wb = openpyxl.Workbook()
+
+    # ── Sheet 1: Job Tracker ──────────────────────────────────────────────────
     ws = wb.active
     ws.title = "Job Tracker"
 
-    # Header row styling
-    header_fill = PatternFill("solid", fgColor="1D3557")
-    header_font = Font(bold=True, color="FFFFFF", size=11)
-    border = Border(bottom=Side(style="thin", color="CCCCCC"))
+    hdr_fill = PatternFill("solid", fgColor="1D3557")
+    hdr_font = Font(bold=True, color="FFFFFF", size=11)
+    thin     = Border(bottom=Side(style="thin", color="CCCCCC"))
 
-    for col_idx, col_name in enumerate(EXCEL_COLS, 1):
-        cell = ws.cell(row=1, column=col_idx, value=col_name)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = border
+    for ci, name in enumerate(EXCEL_COLS, 1):
+        c = ws.cell(row=1, column=ci, value=name)
+        c.fill = hdr_fill; c.font = hdr_font
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = thin
 
-    # Column widths
-    widths = [14, 14, 22, 40, 11, 13, 35, 25, 45, 50, 14, 20]
-    for i, w in enumerate(widths, 1):
+    for i, w in enumerate(COL_WIDTHS, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
-
-    ws.row_dimensions[1].height = 22
+    ws.row_dimensions[1].height = 24
     ws.freeze_panes = "A2"
+
+    # ── Sheet 2: Dashboard ────────────────────────────────────────────────────
+    dash = wb.create_sheet("Dashboard")
+    _build_dashboard(dash, [], is_init=True)
+
+    # ── Sheet 3: Legend ───────────────────────────────────────────────────────
+    leg = wb.create_sheet("Legend")
+    _build_legend(leg)
+
     wb.save(EXCEL_PATH)
     return wb
 
 
+def _build_dashboard(ws, jobs: list[dict], is_init=False):
+    """Write summary stats to the Dashboard sheet."""
+    ws.delete_rows(1, ws.max_row + 1)   # clear existing
+
+    title_font  = Font(bold=True, size=14, color="1D3557")
+    head_fill   = PatternFill("solid", fgColor="1D3557")
+    head_font   = Font(bold=True, color="FFFFFF", size=11)
+    sub_fill    = PatternFill("solid", fgColor="E8F4FD")
+    sub_font    = Font(bold=True, size=11)
+
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 18
+    ws.column_dimensions["D"].width = 18
+
+    # Title
+    ws["A1"] = f"📊  Job Hunt Dashboard — {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    ws["A1"].font = title_font
+    ws.row_dimensions[1].height = 28
+
+    if is_init or not jobs:
+        ws["A3"] = "No data yet — run the pipeline to populate."
+        ws["A3"].font = Font(italic=True, color="888888")
+        return
+
+    # ── Visa type breakdown ───────────────────────────────────────────────────
+    ws["A3"] = "Visa Type Breakdown"
+    ws["A3"].font = head_font; ws["A3"].fill = head_fill
+    ws["B3"].fill = head_fill; ws["C3"].fill = head_fill
+    ws["B3"].font = head_font; ws["C3"].font = head_font
+    ws["B3"] = "Count"; ws["C3"] = "% of Total"
+
+    from collections import Counter
+    visa_counts = Counter(_visa_type_label(j) for j in jobs)
+    total = len(jobs)
+    row = 4
+    for label, color in VISA_TYPE_COLORS.items():
+        count = visa_counts.get(label, 0)
+        ws.cell(row, 1, label).font = Font(bold=True)
+        ws.cell(row, 1).fill = PatternFill("solid", fgColor=color)
+        ws.cell(row, 2, count)
+        ws.cell(row, 3, f"{count/total*100:.1f}%" if total else "0%")
+        row += 1
+
+    # ── Status breakdown ─────────────────────────────────────────────────────
+    row += 1
+    ws.cell(row, 1, "Application Status").font = head_font
+    ws.cell(row, 1).fill = head_fill
+    ws.cell(row, 2, "Count").font = head_font; ws.cell(row, 2).fill = head_fill
+    status_col = EXCEL_COLS.index("Status") + 1
+    # Count statuses from jobs list
+    status_counts = Counter(j.get("status", "New") for j in jobs)
+    row += 1
+    for status, color in STATUS_COLORS.items():
+        count = status_counts.get(status, 0)
+        ws.cell(row, 1, status).font = Font(bold=True)
+        ws.cell(row, 1).fill = PatternFill("solid", fgColor=color)
+        if status in STATUS_WHITE_TEXT:
+            ws.cell(row, 1).font = Font(bold=True, color="FFFFFF")
+        ws.cell(row, 2, count)
+        row += 1
+
+    # ── Top companies ─────────────────────────────────────────────────────────
+    row += 1
+    ws.cell(row, 1, "Top Companies (by job count)").font = head_font
+    ws.cell(row, 1).fill = head_fill
+    ws.cell(row, 2, "Jobs").font = head_font; ws.cell(row, 2).fill = head_fill
+    ws.cell(row, 3, "Avg ATS").font = head_font; ws.cell(row, 3).fill = head_fill
+    row += 1
+    from itertools import groupby
+    by_company: dict = {}
+    for j in jobs:
+        co = j.get("company", "Unknown")
+        by_company.setdefault(co, []).append(j.get("score", 0))
+    top = sorted(by_company.items(), key=lambda x: len(x[1]), reverse=True)[:10]
+    for co, scores in top:
+        ws.cell(row, 1, co); ws.cell(row, 2, len(scores))
+        ws.cell(row, 3, f"{sum(scores)/len(scores):.0f}%")
+        ws.cell(row, 1).fill = sub_fill
+        row += 1
+
+
+def _build_legend(ws):
+    """Populate the Legend sheet with column explanations and status guide."""
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["B"].width = 55
+
+    hdr_fill = PatternFill("solid", fgColor="1D3557")
+    hdr_font = Font(bold=True, color="FFFFFF", size=11)
+    sub_font = Font(bold=True, size=11, color="1D3557")
+
+    def hrow(row, a, b=""):
+        ws.cell(row, 1, a).fill = hdr_fill; ws.cell(row, 1).font = hdr_font
+        ws.cell(row, 2, b).fill = hdr_fill; ws.cell(row, 2).font = hdr_font
+
+    row = 1
+    hrow(row, "Column", "Description"); row += 1
+    for name in EXCEL_COLS:
+        descs = {
+            "Date Found":     "Timestamp the job was scraped",
+            "Source":         "Portal or company site it came from",
+            "Company":        "Employer name",
+            "Job Title":      "Role title as listed",
+            "ATS Score":      "Keyword match score vs your resume (0-100%)",
+            "Visa Type":      "H1B / OPT-CPT / STEM-OPT / POSSIBLE / NO SPONSOR",
+            "H1B Sponsor":    "YES=confirmed H1B, UNKNOWN=not stated, NO=explicitly rejected",
+            "OPT/CPT Ok":     "YES=OPT/CPT signals detected, UNKNOWN=not stated, NO=rejected",
+            "Match Skills":   "Top skills found in the job description matching your resume",
+            "Gaps":           "Key skills mentioned in JD but not in your resume",
+            "AI Summary":     "Auto-generated snippet about the match quality",
+            "Apply URL":      "Direct link to the application page",
+            "Status":         "Your application status — update manually (see status guide below)",
+            "Interview Date": "Date of scheduled interview — fill in manually",
+            "Follow-Up Date": "Date to follow up if no response — fill in manually",
+            "Offer Details":  "Salary / benefits / notes if offer received",
+            "Notes":          "Any free-form notes",
+        }
+        ws.cell(row, 1, name).font = Font(bold=True)
+        ws.cell(row, 2, descs.get(name, ""))
+        row += 1
+
+    row += 1
+    hrow(row, "Status Value", "Meaning / Color"); row += 1
+    for status, color in STATUS_COLORS.items():
+        c1 = ws.cell(row, 1, status)
+        c1.fill = PatternFill("solid", fgColor=color)
+        c1.font = Font(bold=True, color="FFFFFF" if status in STATUS_WHITE_TEXT else "000000")
+        meanings = {
+            "New":             "Just scraped — not yet reviewed",
+            "Saved":           "Bookmarked to apply later",
+            "Applied":         "Application submitted",
+            "Phone Screen":    "Recruiter phone call scheduled/done",
+            "Interview":       "Technical / behavioral interview scheduled",
+            "Take-Home Test":  "Coding challenge / assignment received",
+            "Final Round":     "In final interview stage",
+            "Offer Received":  "Written offer in hand",
+            "Offer Accepted":  "Offer accepted — congrats!",
+            "Offer Declined":  "Offer declined",
+            "Rejected":        "Application rejected",
+            "Ghosted":         "No response after follow-up",
+            "Withdrawn":       "You withdrew the application",
+            "On Hold":         "Company paused hiring",
+        }
+        ws.cell(row, 2, meanings.get(status, ""))
+        row += 1
+
+    row += 1
+    hrow(row, "Visa Type", "Meaning"); row += 1
+    visa_meanings = {
+        "H1B":       "Company confirmed H1B visa sponsorship",
+        "OPT-CPT":   "Company accepts OPT / CPT work authorization",
+        "STEM-OPT":  "Company explicitly mentions STEM-OPT extension",
+        "POSSIBLE":  "No explicit mention — verify before applying",
+        "NO SPONSOR":"Explicitly states no sponsorship / citizens only",
+    }
+    for label, meaning in visa_meanings.items():
+        color = VISA_TYPE_COLORS[label]
+        c1 = ws.cell(row, 1, label)
+        c1.fill = PatternFill("solid", fgColor=color)
+        c1.font = Font(bold=True)
+        ws.cell(row, 2, meaning)
+        row += 1
+
+
 def append_jobs_to_excel(jobs: list[dict]):
-    wb = init_excel()
-    ws = wb.active
+    wb    = init_excel()
+    ws    = wb["Job Tracker"]
+    dash  = wb["Dashboard"]
+
     next_row = ws.max_row + 1
 
-    score_colors = {
-        "high":   "C8F7C5",  # green
-        "medium": "FFF3CD",  # yellow
-        "low":    "F8D7DA",  # red
-    }
-    status_color = PatternFill("solid", fgColor="E8F4FD")
+    score_colors = {"high": "C8F7C5", "medium": "FFF3CD", "low": "F8D7DA"}
 
     for job in jobs:
-        score = job.get("score", 0)
-        tier  = "high" if score >= 80 else "medium" if score >= 65 else "low"
+        score      = job.get("score", 0)
+        tier       = "high" if score >= 80 else "medium" if score >= 65 else "low"
+        h1b        = job.get("h1b_likely", "unknown")
+        opt        = job.get("opt_cpt_likely", "unknown")
+        visa_label = _visa_type_label(job)
+        visa_color = VISA_TYPE_COLORS.get(visa_label, "FFFFFF")
+
+        # H1B column color
+        h1b_color = "C8F7C5" if h1b == "yes" else "FFF3CD" if h1b == "unknown" else "F8D7DA"
+        # OPT/CPT column color
+        opt_color = "BDE0FE" if opt == "yes" else "FFF3CD" if opt == "unknown" else "F8D7DA"
 
         row_data = [
-            datetime.now().strftime("%Y-%m-%d %H:%M"),
-            job.get("source", "Company Site"),
-            job.get("company", ""),
-            job.get("title", ""),
-            score,
-            job.get("h1b_likely", "unknown").upper(),
-            job.get("match_reasons", ""),
-            job.get("gaps", ""),
-            job.get("ai_summary", ""),
-            job.get("url", ""),
-            "New",
-            ""
+            datetime.now().strftime("%Y-%m-%d %H:%M"),  # A Date Found
+            job.get("source", "Company Site"),           # B Source
+            job.get("company", ""),                      # C Company
+            job.get("title", ""),                        # D Job Title
+            score,                                       # E ATS Score
+            visa_label,                                  # F Visa Type
+            h1b.upper(),                                 # G H1B Sponsor
+            opt.upper(),                                 # H OPT/CPT Ok
+            job.get("match_reasons", ""),                # I Match Skills
+            job.get("gaps", ""),                         # J Gaps
+            job.get("ai_summary", ""),                   # K AI Summary
+            job.get("url", ""),                          # L Apply URL
+            "New",                                       # M Status
+            "",                                          # N Interview Date
+            "",                                          # O Follow-Up Date
+            "",                                          # P Offer Details
+            "",                                          # Q Notes
         ]
 
-        for col_idx, value in enumerate(row_data, 1):
-            cell = ws.cell(row=next_row, column=col_idx, value=value)
+        for ci, value in enumerate(row_data, 1):
+            cell = ws.cell(row=next_row, column=ci, value=value)
             cell.alignment = Alignment(wrap_text=True, vertical="top")
-            if col_idx == 4:  # ATS score — color by tier
+            if ci == 5:   # ATS Score
                 cell.fill = PatternFill("solid", fgColor=score_colors[tier])
                 cell.font = Font(bold=True)
-            if col_idx == 10:  # Status
-                cell.fill = status_color
+            elif ci == 6: # Visa Type
+                cell.fill = PatternFill("solid", fgColor=visa_color)
+                cell.font = Font(bold=True)
+            elif ci == 7: # H1B Sponsor
+                cell.fill = PatternFill("solid", fgColor=h1b_color)
+                cell.font = Font(bold=True)
+            elif ci == 8: # OPT/CPT Ok
+                cell.fill = PatternFill("solid", fgColor=opt_color)
+                cell.font = Font(bold=True)
+            elif ci == 13: # Status
+                status_color = STATUS_COLORS.get("New", "DDEEFF")
+                cell.fill = PatternFill("solid", fgColor=status_color)
 
-        ws.row_dimensions[next_row].height = 36
+        ws.row_dimensions[next_row].height = 38
         next_row += 1
+
+    # Refresh dashboard with all rows
+    all_jobs_from_sheet = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if row[0]:  # Date Found not empty
+            all_jobs_from_sheet.append({
+                "h1b_likely":     (row[6] or "unknown").lower(),
+                "opt_cpt_likely": (row[7] or "unknown").lower(),
+                "score":          row[4] or 0,
+                "company":        row[2] or "",
+                "snippet":        row[10] or "",
+                "title":          row[3] or "",
+                "status":         row[12] or "New",
+            })
+    _build_dashboard(dash, all_jobs_from_sheet)
 
     wb.save(EXCEL_PATH)
     log.info(f"Saved {len(jobs)} jobs to {EXCEL_PATH}")
@@ -643,49 +1015,47 @@ def append_jobs_to_excel(jobs: list[dict]):
 # ─────────────────────────────────────────────
 
 EMAIL_TEMPLATE = """\
-Subject: Application for {job_title} – {your_name} | Senior SDET / QA Automation Engineer
-
 Dear Hiring Team at {company},
 
 I am writing to express my strong interest in the {job_title} position at {company}.
 
-As a Senior SDET with 4+ years at American Express, I bring:
-• Led migration of 1,000+ test scenarios Selenium → Playwright (60% faster execution)
-• 70% increase in regression coverage via scalable cross-browser automation framework  
-• 500+ automated end-to-end web & API test scenarios (Selenium, RestAssured, Playwright)
-• Zero critical defects across multiple production releases as QA sign-off lead
-• Deep expertise in Java, Python, Cucumber BDD, Jenkins/GitHub Actions CI/CD, Salesforce
+{resume_highlight}
 
-I hold an MS in Computer Science from the University of Central Missouri and am currently
-on H1B status — I am actively seeking an employer who can provide visa sponsorship.
-
-I would welcome the opportunity to discuss how my automation expertise can strengthen
-{company}'s quality engineering team.
+I require visa sponsorship to work in the US and am actively seeking an employer
+who can support that process. I would welcome the opportunity to discuss how my
+background can strengthen {company}'s team.
 
 Apply link: {apply_url}
 
 Best regards,
 {your_name}
-{your_email}
-+1 816-768-1825
-https://linkedin.com/in/jagadeeshh-b04264176/
+{your_email}{phone_line}{linkedin_line}
 """
 
 def send_application_email(job: dict, to_email: str | None = None):
-    """
-    Sends application email.
-    If to_email is None, sends a digest email to yourself with the job details.
-    """
+    """Send an application email. Defaults to emailing yourself if no recipient given."""
     if not GMAIL_APP_PASS:
         log.warning("GMAIL_APP_PASS not set — skipping email send.")
         return False
 
+    # Build optional signature lines only when the values are set
+    phone_line   = f"\n{YOUR_PHONE}"    if YOUR_PHONE    else ""
+    linkedin_line = f"\n{YOUR_LINKEDIN}" if YOUR_LINKEDIN else ""
+
+    # Resume highlight: first non-empty line of RESUME_SUMMARY, or a generic fallback
+    highlight_lines = [l.strip() for l in RESUME_SUMMARY.strip().splitlines() if l.strip()]
+    resume_highlight = highlight_lines[0] if highlight_lines else \
+        "I bring strong technical skills and a track record of delivering quality software."
+
     body = EMAIL_TEMPLATE.format(
-        job_title   = job["title"],
-        company     = job["company"],
-        your_name   = YOUR_NAME,
-        your_email  = YOUR_EMAIL,
-        apply_url   = job.get("url", "See attachment"),
+        job_title        = job["title"],
+        company          = job["company"],
+        your_name        = YOUR_NAME,
+        your_email       = YOUR_EMAIL,
+        apply_url        = job.get("url", "See attachment"),
+        resume_highlight = resume_highlight,
+        phone_line       = phone_line,
+        linkedin_line    = linkedin_line,
     )
 
     recipient = to_email or YOUR_EMAIL  # default: email yourself the digest
@@ -693,7 +1063,7 @@ def send_application_email(job: dict, to_email: str | None = None):
     msg = MIMEMultipart()
     msg["From"]    = YOUR_EMAIL
     msg["To"]      = recipient
-    msg["Subject"] = f"Application: {job['title']} @ {job['company']} | ATS {job.get('score',0)}%"
+    msg["Subject"] = f"Application: {job['title']} @ {job['company']} | {YOUR_TITLE} | ATS {job.get('score',0)}%"
 
     msg.attach(MIMEText(body, "plain"))
 
@@ -714,8 +1084,9 @@ def send_application_email(job: dict, to_email: str | None = None):
             part = MIMEBase("application", "octet-stream")
             part.set_payload(f.read())
             encoders.encode_base64(part)
+            resume_filename = f"{YOUR_NAME.replace(' ', '_')}_Resume.pdf" if YOUR_NAME else "Resume.pdf"
             part.add_header("Content-Disposition",
-                            f'attachment; filename="Sai_Jagadeesh_Hazari_Resume.pdf"')
+                            f'attachment; filename="{resume_filename}"')
             msg.attach(part)
 
     try:
@@ -730,25 +1101,37 @@ def send_application_email(job: dict, to_email: str | None = None):
 
 
 def send_digest_email(shortlisted: list[dict]):
-    """Send yourself a summary digest of all shortlisted jobs."""
+    """Send yourself a summary digest grouped by visa tier."""
     if not GMAIL_APP_PASS or not shortlisted:
         return
 
-    rows = "\n".join(
-        f"  [{j['score']}%] {j['title']} @ {j['company']} — H1B:{j.get('h1b_likely','?').upper()}\n"
-        f"         {j.get('url','no url')}\n"
-        f"         Matches: {j.get('match_reasons','')}"
-        for j in shortlisted
-    )
+    t1 = [j for j in shortlisted if _visa_type_label(j) == "H1B"]
+    t2 = [j for j in shortlisted if _visa_type_label(j) in ("OPT-CPT", "STEM-OPT")]
+    t3 = [j for j in shortlisted if _visa_type_label(j) == "POSSIBLE"]
 
-    body = f"""H1B Job Hunt — Run Summary {datetime.now().strftime('%Y-%m-%d %H:%M')}
-{'='*60}
+    def fmt(jobs):
+        return "\n".join(
+            f"  [{j['score']}%] {j['title']} @ {j['company']}  [{_visa_type_label(j)}]\n"
+            f"         {j.get('url','no url')}\n"
+            f"         Skills: {j.get('match_reasons','')}"
+            for j in jobs
+        ) or "  (none)"
 
-Found {len(shortlisted)} shortlisted jobs (ATS ≥ {MIN_ATS_SCORE}%):
+    body = f"""Job Hunt Digest — {datetime.now().strftime('%Y-%m-%d %H:%M')}   [Mode: {VISA_MODE.upper()}]
+{'='*65}
 
-{rows}
+{len(shortlisted)} shortlisted jobs (ATS ≥ {MIN_ATS_SCORE}%):
 
-Full tracker saved to: job_tracker.xlsx
+✅  CONFIRMED H1B SPONSORSHIP ({len(t1)})
+{fmt(t1)}
+
+🎓  OPT / CPT / STEM-OPT ACCEPTED ({len(t2)})
+{fmt(t2)}
+
+🔍  POSSIBLE — VERIFY BEFORE APPLYING ({len(t3)})
+{fmt(t3)}
+
+Full tracker: job_tracker.xlsx  (3 sheets: Job Tracker · Dashboard · Legend)
 """
     msg = MIMEMultipart()
     msg["From"]    = YOUR_EMAIL
@@ -780,7 +1163,7 @@ Full tracker saved to: job_tracker.xlsx
 
 def run_pipeline():
     log.info("=" * 55)
-    log.info(f"H1B Job Hunt Pipeline — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    log.info(f"Job Hunt Pipeline [{VISA_MODE.upper()} mode] — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     log.info("=" * 55)
 
     seen = load_seen()
@@ -808,19 +1191,41 @@ def run_pipeline():
     log.info("STEP 3/5 — ATS scoring with Claude...")
     scored_jobs = ats_score_batch(new_jobs)
 
-    # 4. Filter: USA / India + H1B + ATS score threshold
+    # 4. Filter: USA / India + role match + visa mode
     log.info("STEP 4/5 — Filtering & shortlisting...")
     location_filtered = [j for j in scored_jobs if location_allowed(j)]
     log.info(f"  Location filtered (USA/India): {len(location_filtered)}")
     role_filtered = [j for j in location_filtered if role_allowed(j)]
-    log.info(f"  Role filtered (QA/SDET/test automation): {len(role_filtered)}")
-    shortlisted = [
-        j for j in role_filtered
-        if j.get("score", 0) >= MIN_ATS_SCORE
-        and j.get("h1b_likely", "unknown") == "yes"
-    ]
-    shortlisted.sort(key=lambda x: x.get("score", 0), reverse=True)
-    log.info(f"  Shortlisted (score≥{MIN_ATS_SCORE}, H1B sponsorship likely): {len(shortlisted)}")
+    log.info(f"  Role filtered (all engineering roles): {len(role_filtered)}")
+
+    # Apply visa mode filter (respects VISA_MODE env var)
+    visa_eligible = [j for j in role_filtered if _visa_eligible(j)]
+    log.info(f"  Visa-eligible (mode={VISA_MODE}): {len(visa_eligible)}")
+
+    # ── Tier 1: Confirmed H1B ────────────────────────────────────────────────
+    confirmed_h1b = sorted(
+        [j for j in visa_eligible if j.get("score", 0) >= MIN_ATS_SCORE
+         and _visa_type_label(j) == "H1B"],
+        key=lambda x: x.get("score", 0), reverse=True
+    )
+    # ── Tier 2: OPT / CPT / STEM-OPT confirmed ───────────────────────────────
+    confirmed_opt = sorted(
+        [j for j in visa_eligible if j.get("score", 0) >= MIN_ATS_SCORE
+         and _visa_type_label(j) in ("OPT-CPT", "STEM-OPT")],
+        key=lambda x: x.get("score", 0), reverse=True
+    )
+    # ── Tier 3: Possible (unknown sponsorship) ────────────────────────────────
+    possible = sorted(
+        [j for j in visa_eligible if j.get("score", 0) >= MIN_ATS_SCORE
+         and _visa_type_label(j) == "POSSIBLE"],
+        key=lambda x: x.get("score", 0), reverse=True
+    )
+
+    log.info(f"  Confirmed H1B ≥{MIN_ATS_SCORE}%: {len(confirmed_h1b)}")
+    log.info(f"  Confirmed OPT/CPT/STEM-OPT ≥{MIN_ATS_SCORE}%: {len(confirmed_opt)}")
+    log.info(f"  Possible (unconfirmed) ≥{MIN_ATS_SCORE}%: {len(possible)}")
+
+    shortlisted = confirmed_h1b + confirmed_opt + possible   # priority order
 
     # 5. Save all scored to Excel
     log.info("STEP 5/5 — Saving to Excel & sending emails...")
@@ -843,9 +1248,27 @@ def run_pipeline():
 
     log.info("─" * 55)
     log.info(f"Done. Scraped: {len(raw_jobs)} | New: {len(new_jobs)} | "
-             f"Shortlisted: {len(shortlisted)} | Applied: {applied_count}")
+             f"H1B: {len(confirmed_h1b)} | OPT/CPT: {len(confirmed_opt)} | "
+             f"Possible: {len(possible)} | Applied: {applied_count}")
     log.info("─" * 55)
 
 
+def validate_config():
+    """Warn loudly if required env vars are missing before the pipeline starts."""
+    missing = []
+    if not YOUR_NAME:   missing.append("YOUR_NAME")
+    if not YOUR_EMAIL:  missing.append("YOUR_EMAIL")
+    if missing:
+        log.error("=" * 55)
+        log.error("MISSING REQUIRED CONFIGURATION:")
+        for v in missing:
+            log.error(f"  ✗  {v}  — set this as a GitHub Secret or env var")
+        log.error("See the module docstring at the top of job_hunter.py for setup instructions.")
+        log.error("=" * 55)
+        raise SystemExit(1)
+    log.info(f"Config OK — user: {YOUR_NAME} | query: '{JOB_SEARCH_QUERY}' | visa mode: {VISA_MODE}")
+
+
 if __name__ == "__main__":
+    validate_config()
     run_pipeline()

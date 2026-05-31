@@ -21,6 +21,8 @@ jobs:
           YOUR_EMAIL: ${{ secrets.YOUR_EMAIL }}
           GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
           RESUME_URL: ${{ secrets.RESUME_URL }}
+          # VISA_MODE: set to "h1b", "opt_cpt", "stem_opt", or "all" (default: all)
+          VISA_MODE: ${{ secrets.VISA_MODE }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
