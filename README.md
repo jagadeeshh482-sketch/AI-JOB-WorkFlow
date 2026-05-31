@@ -59,13 +59,13 @@ Add these 5 secrets:
 ### Resume as Base64
 Run this command on your Mac/Linux terminal:
 ```bash
-base64 -i Sai_Jagadeesh_Hazari_Resume.pdf | tr -d '\n'
+base64 -i your_Resume.pdf | tr -d '\n'
 ```
 Copy the output → paste as `RESUME_PDF_B64`
 
 On Windows (PowerShell):
 ```powershell
-[Convert]::ToBase64String([IO.File]::ReadAllBytes("Sai_Jagadeesh_Hazari_Resume.pdf"))
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("your_Resume.pdf"))
 ```
 
 ---
