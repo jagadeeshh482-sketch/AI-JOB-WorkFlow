@@ -33,8 +33,8 @@ Add these 5 secrets:
 
 | Secret name | Value |
 |---|---|
-| `YOUR_NAME` | `Sai Jagadeesh Hazari` |
-| `YOUR_EMAIL` | `hazarisaijagadeesh@gmail.com` |
+| `YOUR_NAME` | `Your name` |
+| `YOUR_EMAIL` | `youremail@gmail.com` |
 | `GMAIL_APP_PASS` | Your Gmail App Password (see below) |
 | `ANTHROPIC_API_KEY` | Your Anthropic API key (see below) |
 | `RESUME_PDF_B64` | Your resume as base64 (see below) |
