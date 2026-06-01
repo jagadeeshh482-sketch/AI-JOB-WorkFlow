@@ -1,8 +1,8 @@
-# H1B Job Hunt Automation
+# AI Job Hunt Automation
 ### Name — Job Role
 
 Runs every 12 hours via GitHub Actions (free).
-Scrapes → H1B filters → ATS scores vs your resume → saves Excel → emails top matches.
+Scrapes → job filters → ATS scores vs your resume → saves Excel → emails top matches.
 
 ---
 
